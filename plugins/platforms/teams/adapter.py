@@ -796,13 +796,18 @@ class TeamsAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("[teams] Disconnected")
 
-    async def _fetch_attachment_bytes(self, url: str, timeout: float = 30.0) -> bytes:
+    async def _fetch_attachment_bytes(
+        self, url: str, timeout: float = 30.0, headers: Optional[Dict[str, str]] = None
+    ) -> bytes:
         """Download attachment bytes with SSRF protection.
 
-        Teams file attachments carry pre-authenticated SharePoint download
-        URLs (no extra auth header needed). Validates the URL against the
-        SSRF guard and follows redirects through the shared redirect guard,
-        matching the cache_*_from_url helpers in gateway.platforms.base.
+        Teams file-consent attachments carry pre-authenticated SharePoint
+        download URLs (no extra auth header needed) — but other direct-URL
+        attachments (e.g. inline video/audio) can point at the Bot Framework
+        Connector API instead, which requires the bot's own bearer token; see
+        ``_bot_auth_headers_for``. Validates the URL against the SSRF guard
+        and follows redirects through the shared redirect guard, matching the
+        cache_*_from_url helpers in gateway.platforms.base.
         """
         from tools.url_safety import is_safe_url
         from gateway.platforms.base import _ssrf_redirect_guard
@@ -812,15 +817,16 @@ class TeamsAdapter(BasePlatformAdapter):
 
         import httpx
 
+        request_headers = {"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"}
+        if headers:
+            request_headers.update(headers)
+
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             event_hooks={"response": [_ssrf_redirect_guard]},
         ) as client:
-            response = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"},
-            )
+            response = await client.get(url, headers=request_headers)
             response.raise_for_status()
             return response.content
 
@@ -882,6 +888,39 @@ class TeamsAdapter(BasePlatformAdapter):
         media_urls = []
         media_types = []
         media_kinds = []
+
+        # Bot-Framework-hosted attachments (content_url on
+        # smba.trafficmanager.net etc.) require the bot's own bearer token —
+        # unlike SharePoint's pre-authed file-consent downloadUrl. Gated on
+        # the same _ALLOWED_TEAMS_SERVICE_HOSTS allowlist _standalone_send
+        # uses so the bot credential is never sent to an arbitrary host (an
+        # attachment can carry any contentUrl). The token itself is fetched
+        # at most once per turn regardless of how many attachments need it.
+        _bot_token_box: Dict[str, Optional[str]] = {}
+
+        async def bot_auth_headers(url: str) -> Optional[Dict[str, str]]:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_TEAMS_SERVICE_HOSTS:
+                return None
+            if "token" not in _bot_token_box:
+                token_str = None
+                if self._app:
+                    try:
+                        token = await self._app._get_bot_token()
+                        token_str = str(token) if token else None
+                    except Exception:
+                        logger.debug(
+                            "[teams] Failed to acquire bot token for attachment auth",
+                            exc_info=True,
+                        )
+                _bot_token_box["token"] = token_str
+            token_str = _bot_token_box["token"]
+            if not token_str:
+                return None
+            return {"Authorization": f"Bearer {token_str}"}
+
         for att in getattr(activity, "attachments", None) or []:
             content_url = getattr(att, "content_url", None)
             content_type = (getattr(att, "content_type", None) or "").lower()
@@ -924,7 +963,8 @@ class TeamsAdapter(BasePlatformAdapter):
 
             if content_url and content_type.startswith("image/"):
                 try:
-                    cached = await cache_image_from_url(content_url)
+                    auth_headers = await bot_auth_headers(content_url)
+                    cached = await cache_image_from_url(content_url, headers=auth_headers)
                     if cached:
                         media_urls.append(cached)
                         media_types.append(content_type)
@@ -936,7 +976,8 @@ class TeamsAdapter(BasePlatformAdapter):
             if content_url:
                 # Direct-URL non-image attachment (video/audio/document).
                 try:
-                    data = await self._fetch_attachment_bytes(content_url)
+                    auth_headers = await bot_auth_headers(content_url)
+                    data = await self._fetch_attachment_bytes(content_url, headers=auth_headers)
                     cached = cache_media_bytes(
                         data, filename=att_name, mime_type=content_type
                     )

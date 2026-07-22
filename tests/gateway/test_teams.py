@@ -896,6 +896,231 @@ class TestTeamsAttachmentClassification:
         assert event.media_urls == []
 
 
+class TestTeamsInlineImageAuth:
+    """Teams inline image/video/audio attachments carry a content_url on the
+    Bot Framework Connector API (smba.trafficmanager.net/.../views/original),
+    which requires the bot's own bearer token — unlike SharePoint's
+    pre-authed file-consent downloadUrl (see TestTeamsAttachmentClassification
+    ._file_download_attachment). Sending that token anywhere else would leak
+    the bot credential, so it's gated on the same _ALLOWED_TEAMS_SERVICE_HOSTS
+    allowlist _standalone_send already uses (bug found live: Ferdinand
+    silently dropped a receipt photo with a 401, 2026-07-22)."""
+
+    def _make_adapter(self, bot_token="tok123"):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter._app._get_bot_token = AsyncMock(return_value=bot_token)
+        adapter.handle_message = AsyncMock()
+        return adapter
+
+    def _make_activity(self, attachments, text=""):
+        activity = MagicMock()
+        activity.text = text
+        activity.id = "activity-auth-001"
+        activity.from_ = MagicMock()
+        activity.from_.id = "user-123"
+        activity.from_.aad_object_id = "aad-456"
+        activity.from_.name = "Test User"
+        activity.conversation = MagicMock()
+        activity.conversation.id = "19:abc@thread.v2"
+        activity.conversation.conversation_type = "personal"
+        activity.conversation.name = "Test Chat"
+        activity.conversation.tenant_id = "tenant-789"
+        activity.attachments = attachments
+        return activity
+
+    def _make_ctx(self, activity):
+        ctx = MagicMock()
+        ctx.activity = activity
+        return ctx
+
+    def _image_attachment(self, url):
+        att = MagicMock()
+        att.content_type = "image/png"
+        att.content_url = url
+        att.name = "img.png"
+        return att
+
+    def _video_attachment(self, url):
+        att = MagicMock()
+        att.content_type = "video/mp4"
+        att.content_url = url
+        att.name = "clip.mp4"
+        return att
+
+    @pytest.mark.anyio
+    async def test_inline_image_botframework_host_gets_auth_header(self):
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_cache_image(url, *a, **kw):
+            captured["headers"] = kw.get("headers")
+            return "/tmp/img.png"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_url", fake_cache_image)
+            activity = self._make_activity([self._image_attachment(
+                "https://smba.trafficmanager.net/de/tenant/v3/attachments/x/views/original"
+            )])
+            await adapter._on_message(self._make_ctx(activity))
+
+        assert captured["headers"] == {"Authorization": "Bearer tok123"}
+
+    @pytest.mark.anyio
+    async def test_inline_image_gov_host_gets_auth_header(self):
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_cache_image(url, *a, **kw):
+            captured["headers"] = kw.get("headers")
+            return "/tmp/img.png"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_url", fake_cache_image)
+            activity = self._make_activity([self._image_attachment(
+                "https://smba.infra.gov.teams.microsoft.us/v3/attachments/x/views/original"
+            )])
+            await adapter._on_message(self._make_ctx(activity))
+
+        assert captured["headers"] == {"Authorization": "Bearer tok123"}
+
+    @pytest.mark.anyio
+    async def test_inline_image_foreign_host_no_auth_header(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_cache_image(url, *a, **kw):
+            captured["headers"] = kw.get("headers")
+            return "/tmp/img.png"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_url", fake_cache_image)
+            activity = self._make_activity([self._image_attachment("https://cdn.example.com/img.png")])
+            await adapter._on_message(self._make_ctx(activity))
+
+        assert captured["headers"] is None
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.PHOTO
+
+    @pytest.mark.anyio
+    async def test_inline_image_http_scheme_not_authed(self):
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_cache_image(url, *a, **kw):
+            captured["headers"] = kw.get("headers")
+            return "/tmp/img.png"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_url", fake_cache_image)
+            activity = self._make_activity([self._image_attachment(
+                "http://smba.trafficmanager.net/v3/attachments/x/views/original"
+            )])
+            await adapter._on_message(self._make_ctx(activity))
+
+        assert captured["headers"] is None
+
+    @pytest.mark.anyio
+    async def test_token_failure_degrades_to_unauthenticated_fetch(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = self._make_adapter()
+        adapter._app._get_bot_token = AsyncMock(side_effect=Exception("token service down"))
+        captured = {}
+
+        async def fake_cache_image(url, *a, **kw):
+            captured["headers"] = kw.get("headers")
+            return "/tmp/img.png"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_url", fake_cache_image)
+            activity = self._make_activity([self._image_attachment(
+                "https://smba.trafficmanager.net/v3/attachments/x/views/original"
+            )])
+            await adapter._on_message(self._make_ctx(activity))
+
+        assert captured["headers"] is None
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.PHOTO
+
+    @pytest.mark.anyio
+    async def test_token_none_degrades_to_unauthenticated(self):
+        adapter = self._make_adapter(bot_token=None)
+        captured = {}
+
+        async def fake_cache_image(url, *a, **kw):
+            captured["headers"] = kw.get("headers")
+            return "/tmp/img.png"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_url", fake_cache_image)
+            activity = self._make_activity([self._image_attachment(
+                "https://smba.trafficmanager.net/v3/attachments/x/views/original"
+            )])
+            await adapter._on_message(self._make_ctx(activity))
+
+        assert captured["headers"] is None
+
+    @pytest.mark.anyio
+    async def test_multiple_images_fetch_token_once(self):
+        adapter = self._make_adapter()
+
+        async def fake_cache_image(url, *a, **kw):
+            return "/tmp/img.png"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_url", fake_cache_image)
+            activity = self._make_activity([
+                self._image_attachment("https://smba.trafficmanager.net/v3/attachments/a/views/original"),
+                self._image_attachment("https://smba.trafficmanager.net/v3/attachments/b/views/original"),
+            ])
+            await adapter._on_message(self._make_ctx(activity))
+
+        assert adapter._app._get_bot_token.await_count == 1
+
+    @pytest.mark.anyio
+    async def test_authed_download_failure_still_degrades_to_text(self):
+        from gateway.platforms.base import MessageType
+
+        adapter = self._make_adapter()
+
+        async def failing_cache_image(url, *a, **kw):
+            raise Exception("boom")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_teams_mod, "cache_image_from_url", failing_cache_image)
+            activity = self._make_activity([self._image_attachment(
+                "https://smba.trafficmanager.net/v3/attachments/x/views/original"
+            )])
+            await adapter._on_message(self._make_ctx(activity))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.TEXT
+        assert event.media_urls == []
+
+    @pytest.mark.anyio
+    async def test_direct_url_video_botframework_host_gets_auth_header(self):
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_fetch(url, *a, **kw):
+            captured["headers"] = kw.get("headers")
+            return b"FAKEMP4"
+
+        adapter._fetch_attachment_bytes = fake_fetch
+        activity = self._make_activity([self._video_attachment(
+            "https://smba.trafficmanager.net/v3/attachments/x/views/original"
+        )])
+        await adapter._on_message(self._make_ctx(activity))
+
+        assert captured["headers"] == {"Authorization": "Bearer tok123"}
+
+
 # ── _standalone_send (out-of-process cron delivery) ──────────────────────
 
 

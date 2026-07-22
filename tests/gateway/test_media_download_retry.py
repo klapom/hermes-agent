@@ -105,6 +105,55 @@ class TestCacheImageFromUrl:
         assert path.endswith(".jpg")
         mock_client.get.assert_called_once()
 
+    def test_headers_param_none_unchanged(self, _mock_safe, tmp_path, monkeypatch):
+        """No headers param -> only the default User-Agent/Accept are sent."""
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+
+        fake_response = MagicMock()
+        fake_response.content = b"\xff\xd8\xff fake jpeg"
+        fake_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=fake_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def run():
+            with patch("httpx.AsyncClient", return_value=mock_client):
+                from gateway.platforms.base import cache_image_from_url
+                return await cache_image_from_url("http://example.com/img.jpg", ext=".jpg")
+
+        asyncio.run(run())
+        sent_headers = mock_client.get.call_args.kwargs["headers"]
+        assert "Authorization" not in sent_headers
+        assert sent_headers["User-Agent"] == "Mozilla/5.0 (compatible; HermesAgent/1.0)"
+
+    def test_headers_param_merged_over_defaults(self, _mock_safe, tmp_path, monkeypatch):
+        """An explicit headers param (e.g. platform Authorization) is merged in."""
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+
+        fake_response = MagicMock()
+        fake_response.content = b"\xff\xd8\xff fake jpeg"
+        fake_response.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=fake_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def run():
+            with patch("httpx.AsyncClient", return_value=mock_client):
+                from gateway.platforms.base import cache_image_from_url
+                return await cache_image_from_url(
+                    "http://example.com/img.jpg", ext=".jpg",
+                    headers={"Authorization": "Bearer tok123"},
+                )
+
+        asyncio.run(run())
+        sent_headers = mock_client.get.call_args.kwargs["headers"]
+        assert sent_headers["Authorization"] == "Bearer tok123"
+        assert sent_headers["User-Agent"] == "Mozilla/5.0 (compatible; HermesAgent/1.0)"
+
     def test_retries_on_timeout_then_succeeds(self, _mock_safe, tmp_path, monkeypatch):
         """A timeout on the first attempt is retried; second attempt succeeds."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
