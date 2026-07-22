@@ -619,7 +619,9 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     return str(filepath)
 
 
-async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) -> str:
+async def cache_image_from_url(
+    url: str, ext: str = ".jpg", retries: int = 2, headers: Optional[dict] = None
+) -> str:
     """
     Download an image from a URL and save it to the local cache.
 
@@ -630,6 +632,10 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
         url: The HTTP/HTTPS URL to download from.
         ext: File extension including the dot (e.g. ".jpg", ".png").
         retries: Number of retry attempts on transient failures.
+        headers: Extra request headers (e.g. platform-specific
+            ``Authorization``), merged over the defaults. Callers are
+            responsible for only attaching credentials to URLs they trust
+            (e.g. Teams gates this on a Bot Framework host allowlist).
 
     Returns:
         Absolute path to the cached image file as a string.
@@ -644,6 +650,13 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
     import httpx
     _log = logging.getLogger(__name__)
 
+    request_headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+        "Accept": "image/*,*/*;q=0.8",
+    }
+    if headers:
+        request_headers.update(headers)
+
     async with httpx.AsyncClient(
         timeout=30.0,
         follow_redirects=True,
@@ -651,13 +664,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
     ) as client:
         for attempt in range(retries + 1):
             try:
-                response = await client.get(
-                    url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                        "Accept": "image/*,*/*;q=0.8",
-                    },
-                )
+                response = await client.get(url, headers=request_headers)
                 response.raise_for_status()
                 return cache_image_from_bytes(response.content, ext)
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
